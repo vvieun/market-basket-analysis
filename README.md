@@ -4,7 +4,7 @@
 
 Market basket analysis on a synthetic retail transactions dataset.
 
-Finds which products are bought together using **support, confidence and lift** — computed in pure SQL (self-join on the basket grain) on **PostgreSQL**, then visualised. The generator injects real product bundles into random noise, so the analysis has to *recover* the signal. No LLM, no ML library — just SQL and association-rule math.
+Finds which products are bought together using **support, confidence and lift** — computed in pure SQL (self-join on the basket grain) on **PostgreSQL**, then visualised. The generator injects real product bundles into random noise, so the analysis has to *recover* the signal. 
 
 ## Table of contents
 
