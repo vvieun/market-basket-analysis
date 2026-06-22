@@ -1,0 +1,205 @@
+"""Run the market basket analysis against PostgreSQL.
+
+Executes the SQL in ../sql, builds figures, and writes a markdown report with
+the findings. Assumes generate_data.py has already loaded the tables.
+"""
+
+import decimal
+import os
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+import db
+
+HERE = os.path.dirname(__file__)
+SQL_DIR = os.path.join(HERE, "..", "sql")
+FIG_DIR = os.path.join(HERE, "..", "reports", "figures")
+REPORT = os.path.join(HERE, "..", "reports", "basket_report.md")
+
+
+def run_df(sql):
+    """Execute SQL and return a DataFrame, coercing numeric (Decimal) columns."""
+    columns, rows = db.query(sql)
+    df = pd.DataFrame(rows, columns=columns)
+    for c in df.columns:
+        if df[c].map(lambda v: isinstance(v, decimal.Decimal)).any():
+            df[c] = df[c].astype(float)
+    return df
+
+
+def sql_file(name):
+    with open(os.path.join(SQL_DIR, name)) as f:
+        return f.read()
+
+
+def plot_top_items(items, k=12):
+    top = items.head(k).iloc[::-1]
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.barh(top["product_name"], top["support_pct"], color="#4C72B0")
+    ax.set_xlabel("Support (% of baskets)")
+    ax.set_title(f"Top {k} products by support")
+    for y, v in enumerate(top["support_pct"]):
+        ax.text(v + 0.2, y, f"{v:.1f}%", va="center", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(FIG_DIR, "top_items.png"), dpi=130)
+    plt.close(fig)
+
+
+def plot_top_pairs(pairs, k=12):
+    top = pairs.head(k).iloc[::-1]
+    labels = top["item_a"] + " + " + top["item_b"]
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.barh(labels, top["lift"], color="#C44E52")
+    ax.axvline(1.0, color="gray", linestyle="--", linewidth=1,
+               label="lift = 1 (independent)")
+    ax.set_xlabel("Lift")
+    ax.set_title(f"Top {k} product pairs by lift")
+    ax.legend()
+    for y, v in enumerate(top["lift"]):
+        ax.text(v + 0.1, y, f"{v:.1f}", va="center", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(FIG_DIR, "top_pairs_lift.png"), dpi=130)
+    plt.close(fig)
+
+
+def plot_lift_heatmap(items, k=12):
+    top_names = items.head(k)["product_name"].tolist()
+    placeholders = ", ".join("'" + n.replace("'", "''") + "'" for n in top_names)
+    pairs = run_df(f"""
+        with totals as (select count(distinct transaction_id) n_tx from transaction_items),
+        ic as (select product_id, count(distinct transaction_id) cnt
+               from transaction_items group by product_id),
+        pc as (
+            select a.product_id p1, b.product_id p2,
+                   count(distinct a.transaction_id) co
+            from transaction_items a
+            join transaction_items b
+              on a.transaction_id=b.transaction_id and a.product_id<b.product_id
+            group by 1,2
+        )
+        select pa.product_name a, pb.product_name b,
+               (pc.co*1.0*t.n_tx)/(ic_a.cnt*ic_b.cnt) lift
+        from pc cross join totals t
+        join ic ic_a on ic_a.product_id=pc.p1
+        join ic ic_b on ic_b.product_id=pc.p2
+        join products pa on pa.product_id=pc.p1
+        join products pb on pb.product_id=pc.p2
+        where pa.product_name in ({placeholders})
+          and pb.product_name in ({placeholders})
+    """)
+
+    idx = {n: i for i, n in enumerate(top_names)}
+    mat = np.full((k, k), np.nan)
+    for _, r in pairs.iterrows():
+        i, j = idx[r["a"]], idx[r["b"]]
+        mat[i, j] = r["lift"]
+        mat[j, i] = r["lift"]
+
+    fig, ax = plt.subplots(figsize=(9, 8))
+    im = ax.imshow(mat, cmap="RdYlGn", vmin=0, vmax=3)
+    ax.set_xticks(range(k)); ax.set_xticklabels(top_names, rotation=90, fontsize=8)
+    ax.set_yticks(range(k)); ax.set_yticklabels(top_names, fontsize=8)
+    ax.set_title("Pairwise lift among top products\n"
+                 "(green = bought together, red = rarely together)")
+    for i in range(k):
+        for j in range(k):
+            if not np.isnan(mat[i, j]):
+                ax.text(j, i, f"{mat[i, j]:.1f}", ha="center", va="center", fontsize=6)
+    fig.colorbar(im, ax=ax, label="lift")
+    fig.tight_layout()
+    fig.savefig(os.path.join(FIG_DIR, "lift_heatmap.png"), dpi=130)
+    plt.close(fig)
+
+
+def main():
+    os.makedirs(FIG_DIR, exist_ok=True)
+
+    items = run_df(sql_file("item_support.sql"))
+    pairs = run_df(sql_file("pair_rules.sql"))
+    rules = run_df(sql_file("top_rules.sql"))
+
+    plot_top_items(items)
+    plot_top_pairs(pairs)
+    plot_lift_heatmap(items)
+
+    n_tx = db.scalar("select count(distinct transaction_id) from transaction_items")
+    n_products = db.scalar("select count(*) from products")
+    avg_basket = float(db.scalar(
+        "select count(*)::numeric/count(distinct transaction_id) from transaction_items"
+    ))
+
+    lines = []
+    lines.append("# Market basket analysis — report\n")
+    lines.append("_Generated by `src/analyze.py` against PostgreSQL. Numbers are "
+                 "reproducible (fixed random seed)._\n")
+    lines.append("## Executive summary\n")
+    lines.append("| Metric | Value |")
+    lines.append("|---|---:|")
+    lines.append(f"| Transactions (baskets) | {n_tx:,} |")
+    lines.append(f"| Products | {n_products} |")
+    lines.append(f"| Avg basket size | {avg_basket:.2f} |")
+    lines.append(f"| Pairs above min-support | {len(pairs):,} |")
+    lines.append(f"| Strongest pair (lift) | {pairs.iloc[0].item_a} + "
+                 f"{pairs.iloc[0].item_b} ({pairs.iloc[0].lift:.1f}×) |")
+    lines.append("")
+
+    lines.append("## Top products by support\n")
+    lines.append("![top items](figures/top_items.png)\n")
+
+    lines.append("## Strongest associations (lift)\n")
+    lines.append("![top pairs by lift](figures/top_pairs_lift.png)\n")
+    lines.append("| Item A | Item B | Baskets | Support | conf A→B | conf B→A | Lift |")
+    lines.append("|---|---|---:|---:|---:|---:|---:|")
+    for _, r in pairs.head(12).iterrows():
+        lines.append(f"| {r.item_a} | {r.item_b} | {int(r.co_count):,} | "
+                     f"{r.support_pct:.2f}% | {r.conf_a_to_b_pct:.1f}% | "
+                     f"{r.conf_b_to_a_pct:.1f}% | {r.lift:.2f} |")
+    lines.append("")
+
+    lines.append("## Lift heatmap\n")
+    lines.append("![lift heatmap](figures/lift_heatmap.png)\n")
+
+    lines.append("## Best cross-sell rule per product\n")
+    lines.append("\"Customers who buy **A** are most likely to also buy **B**.\"\n")
+    lines.append("| If basket has | Recommend | Confidence | Lift |")
+    lines.append("|---|---|---:|---:|")
+    for _, r in rules.head(12).iterrows():
+        lines.append(f"| {r.antecedent} | {r.consequent} | "
+                     f"{r.confidence_pct:.1f}% | {r.lift:.2f} |")
+    lines.append("")
+
+    top = pairs.iloc[0]
+    lines.append("## Findings & recommendations\n")
+    lines.append(f"1. **The analysis recovers real complement bundles.** The top "
+                 f"pairs by lift ({top.item_a}+{top.item_b} at {top.lift:.1f}×, "
+                 f"and the others in the table) are bought together far more than "
+                 f"chance — these are genuine complements, not coincidence.")
+    lines.append("2. **High lift ≠ high volume.** Some high-lift pairs have modest "
+                 "support; lift finds the *relationship*, support tells you how "
+                 "*often* it matters. Act on pairs that score on both.")
+    lines.append("3. **Cross-sell / placement.** Use the per-product rule table to "
+                 "drive 'frequently bought together' widgets and shelf placement; "
+                 "co-locating complements lifts attach rate.")
+    lines.append("4. **Promo design.** Discount one item in a high-lift pair and "
+                 "expect pull-through on its complement; never discount both at once.")
+    lines.append("")
+
+    with open(REPORT, "w") as f:
+        f.write("\n".join(lines))
+
+    print("=== Market basket analysis ===")
+    print(f"baskets={n_tx:,} products={n_products} avg_basket={avg_basket:.2f}")
+    print(f"pairs above min-support: {len(pairs):,}")
+    print("top 5 pairs by lift:")
+    for _, r in pairs.head(5).iterrows():
+        print(f"  {r.item_a:>14} + {r.item_b:<14} lift={r.lift:.2f} "
+              f"support={r.support_pct:.2f}% conf(A->B)={r.conf_a_to_b_pct:.1f}%")
+    print(f"report -> {os.path.abspath(REPORT)}")
+
+
+if __name__ == "__main__":
+    main()

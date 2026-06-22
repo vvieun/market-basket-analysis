@@ -1,0 +1,16 @@
+name: market-basket
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: analytics
+      POSTGRES_PASSWORD: analytics
+      POSTGRES_DB: basket
+    ports:
+      - "5443:5432"   # non-default host port so it can run alongside other DBs
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
